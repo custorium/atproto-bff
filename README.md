@@ -1,4 +1,12 @@
 
+# Atproto BFF
+
+For now it's a copy of Bluesky's [go-oauth-web-app](https://github.com/bluesky-social/cookbook.git) , intention is to expand it with FedCM and a wallet option for login
+
+Below the original README
+
+---
+---
 # OAuth SDK Web App Example
 
 This is a minimal Go web app showing how to use the OAuth client SDK. For a broader introduction to ATProto OAuth, see https://atproto.com/guides/oauth
