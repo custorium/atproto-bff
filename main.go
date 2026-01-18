@@ -64,9 +64,10 @@ type Server struct {
 }
 
 type TmplData struct {
-	DID    *syntax.DID
-	Handle string
-	Error  string
+	DID           *syntax.DID
+	Handle        string
+	CodeChallenge string
+	Error         string
 }
 
 type SuccessTmplData struct {
@@ -151,6 +152,10 @@ func runServer(cctx *cli.Context) error {
 		OAuth:       oauthClient,
 	}
 
+	//These endpoint implement the verifier
+	http.HandleFunc("GET /verifier-client-metadata.json", srv.VerifierClientMetadata)
+	http.HandleFunc("GET /verifier/callback", srv.VerifierClientMetadata)
+
 	// These endpoints are part of the "external" oauth interface, used by the Authorization Server (PDS or Entryway)
 	http.HandleFunc("GET /oauth-client-metadata.json", srv.ClientMetadata) // must correspond to ClientConfig
 	http.HandleFunc("GET /oauth/jwks.json", srv.JWKS)                      // only needed for confidential clients. must match endpoint listed in client metadata
@@ -162,6 +167,11 @@ func runServer(cctx *cli.Context) error {
 	http.HandleFunc("GET /oauth/login", srv.OAuthLogin)
 	http.HandleFunc("POST /oauth/login", srv.OAuthLogin)
 	http.HandleFunc("GET /oauth/logout", srv.OAuthLogout)
+
+	http.HandleFunc("GET /oauth/fedcmlogin", srv.FedCMLogin)
+	http.HandleFunc("POST /oauth/fedcmlogin", srv.FedCMLogin)
+
+	http.HandleFunc("GET /oauth/walletlogin", srv.AtprotoWalletLogin)
 
 	// These endpoints implement the functionality of the app itself (i.e. homepage, posting to bluesky)
 	// (Endpoint names are similarly arbitrary, modulo templates)
@@ -408,4 +418,28 @@ func (s *Server) Post(w http.ResponseWriter, r *http.Request) {
 		Rkey:   resp.Uri.RecordKey().String(),
 		AtUri:  resp.Uri.String(),
 	})
+}
+
+// VP Verifier
+
+func (s *Server) VerifierClientMetadata(w http.ResponseWriter, r *http.Request) {
+	slog.Info("verifier client metadata request", "url", r.URL, "host", r.Host)
+	meta := VerifierClientMetadata{}
+	meta.ClientID = fmt.Sprintf("https://%s/verifier-client-metadata.json", r.Host)
+	meta.Scope = "atproto"
+	meta.ResponseTypes = append(meta.ResponseTypes, "vp_token")
+	meta.RedirectURIs = append(meta.RedirectURIs, fmt.Sprintf("https://%s/verifier/callback", r.Host))
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(meta); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (s *Server) VerifierCallback(w http.ResponseWriter, r *http.Request) {
+	// ctx := r.Context()
+
+	params := r.URL.Query()
+	slog.Info("received verifier callback", "params", params)
 }
