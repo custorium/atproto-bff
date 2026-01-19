@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -88,26 +87,9 @@ type PushedAuthRequest struct {
 	CodeChallengeMethod string `url:"code_challenge_method"`
 }
 
-//go:embed "fedcm-login.html"
-var tmplFedCMLoginText string
-var tmplFedCMLogin = template.Must(template.Must(template.New("fedcm-login.html").Parse(tmplBaseText)).Parse(tmplFedCMLoginText))
-
 func (s *Server) FedCMLogin(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
-
-	if r.Method != "POST" {
-		//PKCE challenge for fedcm
-		verifier := secureRandomBase64(48)
-		codeChallenge := oauth.S256CodeChallenge(verifier)
-		fmt.Println(codeChallenge)
-
-		err := tmplFedCMLogin.Execute(w, TmplData{CodeChallenge: codeChallenge})
-		if err != nil {
-			fmt.Println(err)
-		}
-		return
-	}
 
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, fmt.Errorf("parsing form data: %w", err).Error(), http.StatusBadRequest)

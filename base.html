@@ -35,8 +35,7 @@
       <li><a href="/bsky/post">Create Post</a></li>
       <li><a href="/oauth/logout">Logout</a></li>
     {{ else }}
-      <li><a href="/oauth/login">Login</a></li>
-      <li><a href="/oauth/fedcmlogin">FedCM Login</a></li>
+      <li><a href="/oauth/login" onclick="fedcmlogin(event)">Login</a></li>
     {{ end }}
       <li><a href="https://github.com/bluesky-social/cookbook/tree/main/go-oauth-web-app">Code</a></li>
     </ul>
@@ -47,5 +46,34 @@
     {{ template "content" . }}
   </section>
 </main>
+  <form id="fedcm" method="post" action="/oauth/fedcmlogin">
+    <input id="idtoken" name="idtoken" type="hidden">
+  </form>
+  <script>
+    async function fedcmlogin(event) {
+      event.preventDefault()
+      event.stopPropagation()
+      const identityCredential = await navigator.credentials.get({
+        identity: {
+          context: "signin",
+          providers: [
+            {
+              configURL: "any",
+              type: "atproto",
+              clientId: "https://explorer.farmapps.eu/oauth-client-metadata.json",
+              params: {
+                "code_challenge": {{.CodeChallenge}},
+                "code_challenge_method": "S256",
+              },
+          },
+        ]
+      }
+    }).catch(e => {
+      window.location="/oauth/login"
+    });
+    document.getElementById("idtoken").value = identityCredential.token
+    document.getElementById("fedcm").submit()
+  }
+</script>
 </body>
 </html>

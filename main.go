@@ -168,7 +168,6 @@ func runServer(cctx *cli.Context) error {
 	http.HandleFunc("POST /oauth/login", srv.OAuthLogin)
 	http.HandleFunc("GET /oauth/logout", srv.OAuthLogout)
 
-	http.HandleFunc("GET /oauth/fedcmlogin", srv.FedCMLogin)
 	http.HandleFunc("POST /oauth/fedcmlogin", srv.FedCMLogin)
 
 	http.HandleFunc("GET /oauth/walletlogin", srv.AtprotoWalletLogin)
@@ -251,7 +250,12 @@ func (s *Server) Homepage(w http.ResponseWriter, r *http.Request) {
 	// attempts to load Session to display links
 	did, sessionID, handle := s.currentSessionDID(r)
 	if did == nil {
-		tmplHome.Execute(w, nil)
+
+		//PKCE challenge for fedcm
+		verifier := secureRandomBase64(48)
+		codeChallenge := oauth.S256CodeChallenge(verifier)
+
+		tmplHome.Execute(w, TmplData{CodeChallenge: codeChallenge})
 		return
 	}
 
