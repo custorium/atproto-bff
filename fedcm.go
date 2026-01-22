@@ -16,8 +16,8 @@ import (
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/auth/oauth"
 	"github.com/bluesky-social/indigo/atproto/syntax"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-querystring/query"
+	"github.com/lestrrat-go/jwx/v2/jwt"
 )
 
 ///////////////////////////////////////
@@ -115,18 +115,25 @@ func StartFedCMAuthFlow(ctx context.Context, app *oauth.ClientApp, idToken strin
 
 	var accountDID syntax.DID
 
-	parser := jwt.NewParser()
-	token, _, err := parser.ParseUnverified(idToken, jwt.MapClaims{})
+	token, err := jwt.ParseInsecure([]byte(idToken))
 	if err != nil {
-		return "", fmt.Errorf("parsing ID token: %w", err)
+		return "", fmt.Errorf("parsing jwt token: %w", err)
+	}
+	identifier, err := syntax.ParseAtIdentifier(token.Subject())
+	if err != nil || !identifier.IsDID() {
+		return "", fmt.Errorf("Invalid identifier")
+	}
+	ident, err := app.Dir.Lookup(ctx, *identifier)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve username (%s): %w", identifier, err)
+	}
+	accountDID = ident.DID
+	host := ident.PDSEndpoint()
+	if host == "" {
+		return "", fmt.Errorf("identity does not link to an atproto host (PDS)")
 	}
 
-	authserverURL, err := token.Claims.GetIssuer()
-	if err != nil {
-		return "", fmt.Errorf("Get issuer from ID token:%w", err)
-	}
-
-	authserverMeta, err := app.Resolver.ResolveAuthServerMetadata(ctx, authserverURL)
+	authserverMeta, err := app.Resolver.ResolveAuthServerMetadata(ctx, host)
 	if err != nil {
 		return "", fmt.Errorf("fetching auth server metadata: %w", err)
 	}
