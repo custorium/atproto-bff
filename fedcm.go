@@ -96,11 +96,9 @@ func (s *Server) FedCMLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idToken, _ := strings.CutPrefix(r.PostFormValue("idtoken"), "@")
-
 	slog.Info("OAuthLogin", "client_id", s.OAuth.Config.ClientID, "callback_url", s.OAuth.Config.CallbackURL)
 
-	redirectURL, err := StartFedCMAuthFlow(ctx, s.OAuth, idToken)
+	redirectURL, err := StartFedCMAuthFlow(ctx, s.OAuth, r.PostFormValue("idtoken"))
 	if err != nil {
 		var oauthErr = fmt.Errorf("OAuth login failed: %w", err).Error()
 		slog.Error(oauthErr)

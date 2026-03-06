@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/carlmjohnson/versioninfo"
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
@@ -50,6 +53,12 @@ func main() {
 				Value:   "primary",
 				EnvVars: []string{"CLIENT_SECRET_KEY_ID"},
 			},
+			&cli.StringFlag{
+				Name:    "plc-host",
+				Usage:   "method, hostname, and port of PLC registry",
+				Value:   "https://plc.directory",
+				EnvVars: []string{"PLC_HOST"},
+			},
 		},
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
@@ -59,7 +68,6 @@ func main() {
 
 type Server struct {
 	CookieStore *sessions.CookieStore
-	Dir         identity.Directory
 	OAuth       *oauth.ClientApp
 }
 
@@ -144,11 +152,14 @@ func runServer(cctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	plchost := cctx.String("plc-host")
+	directory := NewDirectory(plchost)
+
 	oauthClient := oauth.NewClientApp(&config, store)
+	oauthClient.Dir = directory
 
 	srv := Server{
 		CookieStore: sessions.NewCookieStore([]byte(cctx.String("session-secret"))),
-		Dir:         identity.DefaultDirectory(),
 		OAuth:       oauthClient,
 	}
 
@@ -183,6 +194,32 @@ func runServer(cctx *cli.Context) error {
 		slog.Error("http shutdown", "err", err)
 	}
 	return nil
+}
+
+func NewDirectory(plcHost string) identity.Directory {
+	base := identity.BaseDirectory{
+		PLCURL: plcHost,
+		HTTPClient: http.Client{
+			Timeout: time.Second * 10,
+			Transport: &http.Transport{
+				// would want this around 100ms for services doing lots of handle resolution. Impacts PLC connections as well, but not too bad.
+				IdleConnTimeout: time.Millisecond * 1000,
+				MaxIdleConns:    100,
+			},
+		},
+		Resolver: net.Resolver{
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: time.Second * 3}
+				return d.DialContext(ctx, network, address)
+			},
+		},
+		TryAuthoritativeDNS: true,
+		// primary Bluesky PDS instance only supports HTTP resolution method
+		SkipDNSDomainSuffixes: []string{".bsky.social"},
+		UserAgent:             "atproto-bff/" + versioninfo.Short(),
+	}
+	cached := identity.NewCacheDirectory(&base, 250_000, time.Hour*24, time.Minute*2, time.Minute*5)
+	return &cached
 }
 
 func (s *Server) currentSessionDID(r *http.Request) (*syntax.DID, string, string) {

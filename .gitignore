@@ -2,3 +2,5 @@
 *.sqlite3
 *.sqlite
 *.db
+.vscode/launch.json
+go-oauth-web-app
