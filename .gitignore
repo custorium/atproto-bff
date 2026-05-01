@@ -4,3 +4,4 @@
 *.db
 .vscode/launch.json
 go-oauth-web-app
+wwwroot/

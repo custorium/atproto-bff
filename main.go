@@ -3,18 +3,21 @@ package main
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"html/template"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/carlmjohnson/versioninfo"
 	_ "github.com/joho/godotenv/autoload"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 
 	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/auth/oauth"
@@ -24,6 +27,8 @@ import (
 	"github.com/gorilla/sessions"
 	"github.com/urfave/cli/v2"
 )
+
+const serverListenerBootTimeout = 5 * time.Second
 
 func main() {
 	app := cli.App{
@@ -59,9 +64,18 @@ func main() {
 				Value:   "https://plc.directory",
 				EnvVars: []string{"PLC_HOST"},
 			},
+			&cli.StringFlag{
+				Name:  "proxy",
+				Usage: "proxy to sent",
+			},
+			&cli.StringFlag{
+				Name:  "listen",
+				Usage: "listen address",
+				Value: ":4201",
+			},
 		},
 	}
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
 	app.RunAndExitOnError()
 }
@@ -112,14 +126,27 @@ var tmplError = template.Must(template.Must(template.New("error.html").Parse(tmp
 
 func runServer(cctx *cli.Context) error {
 
-	scopes := []string{"atproto", "repo:app.bsky.feed.post?action=create"}
-	bind := ":4201"
+	var lc net.ListenConfig
+	ctx, cancel := context.WithTimeout(context.Background(), serverListenerBootTimeout)
+	defer cancel()
+
+	li, err := lc.Listen(ctx, "tcp", cctx.String("listen"))
+	if err != nil {
+		return err
+	}
+
+	e := echo.New()
+	e.HideBanner = true
+	e.Listener = li
+	httpServer := &http.Server{}
+
+	scopes := []string{"atproto", "include:org.farmapps.temp.ecrop.authFull"}
 
 	var config oauth.ClientConfig
 	hostname := cctx.String("hostname")
 	if hostname == "" {
 		config = oauth.NewLocalhostConfig(
-			fmt.Sprintf("http://127.0.0.1%s/oauth/callback", bind),
+			fmt.Sprintf("http://127.0.0.1:%s/oauth/callback", li.Addr().String()),
 			scopes,
 		)
 		slog.Info("configuring localhost OAuth client", "CallbackURL", config.CallbackURL)
@@ -164,36 +191,41 @@ func runServer(cctx *cli.Context) error {
 	}
 
 	//These endpoint implement the verifier
-	http.HandleFunc("GET /verifier-client-metadata.json", srv.VerifierClientMetadata)
-	http.HandleFunc("GET /verifier/callback", srv.VerifierClientMetadata)
+	e.GET("/verifier-client-metadata.json", srv.VerifierClientMetadata)
+	e.GET("/verifier/callback", srv.VerifierClientMetadata)
 
 	// These endpoints are part of the "external" oauth interface, used by the Authorization Server (PDS or Entryway)
-	http.HandleFunc("GET /oauth-client-metadata.json", srv.ClientMetadata) // must correspond to ClientConfig
-	http.HandleFunc("GET /oauth/jwks.json", srv.JWKS)                      // only needed for confidential clients. must match endpoint listed in client metadata
-	http.HandleFunc("GET /oauth/callback", srv.OAuthCallback)              // must correspond to ClientConfig
+	e.GET("/oauth-client-metadata.json", srv.ClientMetadata) // must correspond to ClientConfig
+	oauth := e.Group("/oauth")
+	oauth.GET("/jwks.json", srv.JWKS)         // only needed for confidential clients. must match endpoint listed in client metadata
+	oauth.GET("/callback", srv.OAuthCallback) // must correspond to ClientConfig
 	// The AS redirects the user's browser to the callback endpoint, after auth (successful or otherwise)
 
 	// These are user-facing endpoints for managing oauth session lifecycle, called via the user's browser.
 	// The endpoint names here are arbitrary although they are also referenced in the HTML templates.
-	http.HandleFunc("GET /oauth/login", srv.OAuthLogin)
-	http.HandleFunc("POST /oauth/login", srv.OAuthLogin)
-	http.HandleFunc("GET /oauth/logout", srv.OAuthLogout)
+	oauth.GET("/login", srv.OAuthLogin)
+	oauth.POST("/login", srv.OAuthLogin)
+	oauth.GET("/logout", srv.OAuthLogout)
+	oauth.GET("/authenticated", srv.Authenticated)
 
-	http.HandleFunc("POST /oauth/fedcmlogin", srv.FedCMLogin)
+	api := e.Group("/api")
+	api.Any("/*", srv.Proxy)
 
-	http.HandleFunc("GET /oauth/walletlogin", srv.AtprotoWalletLogin)
+	// http.HandleFunc("POST /oauth/fedcmlogin", srv.FedCMLogin)
 
-	// These endpoints implement the functionality of the app itself (i.e. homepage, posting to bluesky)
-	// (Endpoint names are similarly arbitrary, modulo templates)
-	http.HandleFunc("GET /", srv.Homepage)
-	http.HandleFunc("GET /bsky/post", srv.Post)
-	http.HandleFunc("POST /bsky/post", srv.Post)
+	// http.HandleFunc("GET /oauth/walletlogin", srv.AtprotoWalletLogin)
+	e.Use(middleware.StaticWithConfig(middleware.StaticConfig{
+		Root:   "./wwwroot",
+		Browse: false,
+		HTML5:  true,
+	}))
 
-	slog.Info("starting http server", "bind", bind)
-	if err := http.ListenAndServe(bind, nil); err != nil {
-		slog.Error("http shutdown", "err", err)
-	}
-	return nil
+	// http.HandleFunc("GET /", srv.Homepage)
+	// http.HandleFunc("GET /bsky/post", srv.Post)
+	// http.HandleFunc("POST /bsky/post", srv.Post)
+
+	slog.Info("starting http server", "bind", li.Addr().String())
+	return e.StartServer(httpServer)
 }
 
 func NewDirectory(plcHost string) identity.Directory {
@@ -248,239 +280,274 @@ func strPtr(raw string) *string {
 	return &raw
 }
 
-func (s *Server) ClientMetadata(w http.ResponseWriter, r *http.Request) {
-	slog.Info("client metadata request", "url", r.URL, "host", r.Host)
+func (s *Server) ClientMetadata(c echo.Context) error {
+	slog.Info("client metadata request", "url", c.Request().URL, "host", c.Request().Host)
 
 	meta := s.OAuth.Config.ClientMetadata()
 	if s.OAuth.Config.IsConfidential() {
-		meta.JWKSURI = strPtr(fmt.Sprintf("https://%s/oauth/jwks.json", r.Host))
+		meta.JWKSURI = strPtr(fmt.Sprintf("https://%s/oauth/jwks.json", c.Request().Host))
 	}
-	meta.ClientName = strPtr("indigo atp-oauth-demo")
-	meta.ClientURI = strPtr(fmt.Sprintf("https://%s", r.Host))
+	meta.ClientName = strPtr("Farmapps Explorer")
+	meta.ClientURI = strPtr(fmt.Sprintf("https://%s", c.Request().Host))
+	tosUri := "https://explorer.farmapps.eu/tos.html"
+	meta.TosURI = &tosUri
+	policyUri := "https://explorer.farmapps.eu/policy.html"
+	meta.PolicyURI = &policyUri
 
 	// internal consistency check
 	if err := meta.Validate(s.OAuth.Config.ClientID); err != nil {
 		slog.Error("validating client metadata", "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return echo.ErrInternalServerError
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(meta); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	return c.JSON(http.StatusOK, meta)
 }
 
-func (s *Server) JWKS(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+func (s *Server) JWKS(c echo.Context) error {
 	body := s.OAuth.Config.PublicJWKS()
-	if err := json.NewEncoder(w).Encode(body); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	return c.JSON(http.StatusOK, body)
 }
 
-func (s *Server) Homepage(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
+func (s *Server) Homepage(c echo.Context) error {
 	// attempts to load Session to display links
-	did, sessionID, handle := s.currentSessionDID(r)
+	did, sessionID, handle := s.currentSessionDID(c.Request())
 	if did == nil {
 
 		//PKCE challenge for fedcm
 		verifier := secureRandomBase64(48)
 		codeChallenge := oauth.S256CodeChallenge(verifier)
 
-		tmplHome.Execute(w, TmplData{CodeChallenge: codeChallenge})
-		return
+		tmplHome.Execute(c.Response(), TmplData{CodeChallenge: codeChallenge})
+		return nil
 	}
 
-	_, err := s.OAuth.ResumeSession(ctx, *did, sessionID)
+	_, err := s.OAuth.ResumeSession(c.Request().Context(), *did, sessionID)
 	if err != nil {
-		tmplHome.Execute(w, nil)
-		return
+		tmplHome.Execute(c.Response(), nil)
+		return nil
 	}
-	tmplHome.Execute(w, TmplData{DID: did, Handle: handle})
+	tmplHome.Execute(c.Response(), TmplData{DID: did, Handle: handle})
+	return nil
 }
 
-func (s *Server) OAuthLogin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func (s *Server) Authenticated(c echo.Context) error {
 
-	if r.Method != "POST" {
-		tmplLogin.Execute(w, nil)
-		return
+	// attempts to load Session to display links
+	did, sessionID, _ := s.currentSessionDID(c.Request())
+	if did == nil {
+		return c.JSON(http.StatusUnauthorized, false)
 	}
 
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, fmt.Errorf("parsing form data: %w", err).Error(), http.StatusBadRequest)
-		return
+	_, err := s.OAuth.ResumeSession(c.Request().Context(), *did, sessionID)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, false)
+	}
+	return c.JSON(http.StatusOK, true)
+}
+
+func (s *Server) OAuthLogin(c echo.Context) error {
+	if c.Request().Method != "POST" {
+		tmplLogin.Execute(c.Response(), nil)
+		return nil
 	}
 
-	username, _ := strings.CutPrefix(r.PostFormValue("username"), "@")
+	if err := c.Request().ParseForm(); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Errorf("parsing form data: %w", err))
+	}
+
+	username, _ := strings.CutPrefix(c.Request().PostFormValue("username"), "@")
 
 	slog.Info("OAuthLogin", "client_id", s.OAuth.Config.ClientID, "callback_url", s.OAuth.Config.CallbackURL)
 
-	redirectURL, err := s.OAuth.StartAuthFlow(ctx, username)
+	redirectURL, err := s.OAuth.StartAuthFlow(c.Request().Context(), username)
 	if err != nil {
 		var oauthErr = fmt.Errorf("OAuth login failed: %w", err).Error()
 		slog.Error(oauthErr)
-		tmplLogin.Execute(w, TmplData{Error: oauthErr})
-		return
+		tmplLogin.Execute(c.Response(), TmplData{Error: oauthErr})
+		return nil
 	}
 
-	http.Redirect(w, r, redirectURL, http.StatusFound)
+	return c.Redirect(http.StatusFound, redirectURL)
 }
 
-func (s *Server) OAuthCallback(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	params := r.URL.Query()
+func (s *Server) OAuthCallback(c echo.Context) error {
+	params := c.Request().URL.Query()
 	slog.Info("received callback", "params", params)
 
-	sessData, err := s.OAuth.ProcessCallback(ctx, r.URL.Query())
+	sessData, err := s.OAuth.ProcessCallback(c.Request().Context(), c.Request().URL.Query())
 	if err != nil {
 		var callbackErr = fmt.Errorf("failed processing oauth callback: %w", err).Error()
 		slog.Error(callbackErr)
-		tmplError.Execute(w, TmplData{Error: callbackErr})
-		return
+		tmplError.Execute(c.Response(), TmplData{Error: callbackErr})
+		return nil
 	}
 
 	// retrieve session metadata
-	oauthSess, err := s.OAuth.ResumeSession(ctx, sessData.AccountDID, sessData.SessionID)
+	oauthSess, err := s.OAuth.ResumeSession(c.Request().Context(), sessData.AccountDID, sessData.SessionID)
 	if err != nil {
-		http.Error(w, "not authenticated", http.StatusUnauthorized)
-		return
+		return echo.NewHTTPError(http.StatusUnauthorized, "not authenticated")
 	}
-	c := oauthSess.APIClient()
+	clnt := oauthSess.APIClient()
 	var resp struct {
 		Handle string `json:"handle"`
 		// TODO: more fields?
 	}
-	if err := c.Get(ctx, "com.atproto.server.getSession", nil, &resp); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if err := clnt.Get(c.Request().Context(), "com.atproto.server.getSession", nil, &resp); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	// create signed cookie session, indicating account DID
-	sess, _ := s.CookieStore.Get(r, "oauth-demo")
+	sess, _ := s.CookieStore.Get(c.Request(), "oauth-demo")
 	sess.Values["account_did"] = sessData.AccountDID.String()
 	sess.Values["session_id"] = sessData.SessionID
 	sess.Values["handle"] = resp.Handle
-	if err := sess.Save(r, w); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if err := sess.Save(c.Request(), c.Response()); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	slog.Info("login successful", "did", sessData.AccountDID.String())
-	http.Redirect(w, r, "/bsky/post", http.StatusFound)
+	return c.Redirect(http.StatusFound, "/")
 }
 
-func (s *Server) OAuthLogout(w http.ResponseWriter, r *http.Request) {
+func (s *Server) OAuthLogout(c echo.Context) error {
 
 	// revoke tokens and delete session from auth store
-	did, sessionID, _ := s.currentSessionDID(r)
+	did, sessionID, _ := s.currentSessionDID(c.Request())
 	if did != nil {
-		if err := s.OAuth.Logout(r.Context(), *did, sessionID); err != nil {
+		if err := s.OAuth.Logout(c.Request().Context(), *did, sessionID); err != nil {
 			slog.Error("failed to delete session", "did", did, "err", err)
 		}
 	}
 
 	// wipe all secure cookie session data
-	sess, _ := s.CookieStore.Get(r, "oauth-demo")
+	sess, _ := s.CookieStore.Get(c.Request(), "oauth-demo")
 	sess.Values = make(map[any]any)
-	err := sess.Save(r, w)
+	err := sess.Save(c.Request(), c.Response())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	slog.Info("logged out")
-	http.Redirect(w, r, "/", http.StatusFound)
+	return c.Redirect(http.StatusFound, "/")
 }
 
-func (s *Server) Post(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+func copyHeader(src http.Header, target http.Header, header string) {
+	values := src.Values(header)
+	for _, v := range values {
+		target.Add(header, v)
+	}
+}
 
-	slog.Info("in post handler")
-
-	did, sessionID, handle := s.currentSessionDID(r)
+func (s *Server) Proxy(c echo.Context) error {
+	did, sessionID, _ := s.currentSessionDID(c.Request())
 	if did == nil {
-		// TODO: supposed to set a WWW header; and could redirect?
-		http.Error(w, "not authenticated", http.StatusUnauthorized)
-		return
+		return c.JSON(http.StatusUnauthorized, false)
 	}
 
-	if r.Method != "POST" {
-		tmplPost.Execute(w, TmplData{DID: did, Handle: handle})
-		return
-	}
-
-	oauthSess, err := s.OAuth.ResumeSession(ctx, *did, sessionID)
+	session, err := s.OAuth.ResumeSession(c.Request().Context(), *did, sessionID)
 	if err != nil {
-		http.Error(w, "not authenticated", http.StatusUnauthorized)
-		return
+		return c.JSON(http.StatusUnauthorized, false)
 	}
-	c := oauthSess.APIClient()
 
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, fmt.Errorf("parsing form data: %w", err).Error(), http.StatusBadRequest)
-		return
-	}
-	text := r.PostFormValue("post_text")
+	target, _ := url.Parse("https://test.farmmaps.eu")
 
-	body := map[string]any{
-		"repo":       c.AccountDID.String(),
-		"collection": "app.bsky.feed.post",
-		"record": map[string]any{
-			"$type":     "app.bsky.feed.post",
-			"text":      text,
-			"facets":    parseFacets(text),
-			"createdAt": syntax.DatetimeNow(),
+	headers := http.Header{}
+	copyHeader(c.Request().Header, headers, "accept")
+	copyHeader(c.Request().Header, headers, "accept-encoding")
+	copyHeader(c.Request().Header, headers, "accept-language")
+	copyHeader(c.Request().Header, headers, "atproto-accept-labelers")
+	copyHeader(c.Request().Header, headers, "atproto-accept-labelers")
+	copyHeader(c.Request().Header, headers, "x-bsky-topics")
+	copyHeader(c.Request().Header, headers, "content-type")
+	copyHeader(c.Request().Header, headers, "content-encoding")
+	copyHeader(c.Request().Header, headers, "content-length")
+	copyHeader(c.Request().Header, headers, "origin")
+	copyHeader(c.Request().Header, headers, "access-control-request-headers")
+	copyHeader(c.Request().Header, headers, "access-control-request-method")
+	headers.Add("authorization", session.Data.AccessToken)
+
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			r.Out.Header = headers
 		},
 	}
-	var resp struct {
-		Uri syntax.ATURI `json:"uri"` // the only field we care about
-	}
+	proxy.ServeHTTP(c.Response(), c.Request())
 
-	slog.Info("attempting post...", "text", text)
-	if err := c.Post(ctx, "com.atproto.repo.createRecord", body, &resp); err != nil {
-		postErr := fmt.Errorf("posting failed: %w", err).Error()
-		slog.Error(postErr)
-		tmplError.Execute(w, TmplData{DID: did, Handle: handle, Error: postErr})
-		return
-	}
-
-	tmplPostSuccess.Execute(w, SuccessTmplData{
-		DID:    did,
-		Handle: handle,
-		PdsUrl: oauthSess.Data.HostURL,
-		Repo:   resp.Uri.Authority().String(),
-		Rkey:   resp.Uri.RecordKey().String(),
-		AtUri:  resp.Uri.String(),
-	})
+	return nil
 }
+
+// func (s *Server) Post(w http.ResponseWriter, r *http.Request) {
+// 	ctx := r.Context()
+
+// 	slog.Info("in post handler")
+
+// 	did, sessionID, handle := s.currentSessionDID(r)
+// 	if did == nil {
+// 		// TODO: supposed to set a WWW header; and could redirect?
+// 		http.Error(w, "not authenticated", http.StatusUnauthorized)
+// 		return
+// 	}
+
+// 	oauthSess, err := s.OAuth.ResumeSession(ctx, *did, sessionID)
+// 	if err != nil {
+// 		http.Error(w, "not authenticated", http.StatusUnauthorized)
+// 		return
+// 	}
+// 	c := oauthSess.APIClient()
+
+// 	if err := r.ParseForm(); err != nil {
+// 		http.Error(w, fmt.Errorf("parsing form data: %w", err).Error(), http.StatusBadRequest)
+// 		return
+// 	}
+// 	text := r.PostFormValue("post_text")
+
+// 	body := map[string]any{
+// 		"repo":       c.AccountDID.String(),
+// 		"collection": "app.bsky.feed.post",
+// 		"record": map[string]any{
+// 			"$type":     "app.bsky.feed.post",
+// 			"text":      text,
+// 			"facets":    parseFacets(text),
+// 			"createdAt": syntax.DatetimeNow(),
+// 		},
+// 	}
+// 	var resp struct {
+// 		Uri syntax.ATURI `json:"uri"` // the only field we care about
+// 	}
+
+// 	slog.Info("attempting post...", "text", text)
+// 	if err := c.Post(ctx, "com.atproto.repo.createRecord", body, &resp); err != nil {
+// 		postErr := fmt.Errorf("posting failed: %w", err).Error()
+// 		slog.Error(postErr)
+// 		tmplError.Execute(w, TmplData{DID: did, Handle: handle, Error: postErr})
+// 		return
+// 	}
+
+// 	tmplPostSuccess.Execute(w, SuccessTmplData{
+// 		DID:    did,
+// 		Handle: handle,
+// 		PdsUrl: oauthSess.Data.HostURL,
+// 		Repo:   resp.Uri.Authority().String(),
+// 		Rkey:   resp.Uri.RecordKey().String(),
+// 		AtUri:  resp.Uri.String(),
+// 	})
+// }
 
 // VP Verifier
 
-func (s *Server) VerifierClientMetadata(w http.ResponseWriter, r *http.Request) {
-	slog.Info("verifier client metadata request", "url", r.URL, "host", r.Host)
+func (s *Server) VerifierClientMetadata(c echo.Context) error {
+	slog.Info("verifier client metadata request", "url", c.Request().URL, "host", c.Request().Host)
 	meta := VerifierClientMetadata{}
-	meta.ClientID = fmt.Sprintf("https://%s/verifier-client-metadata.json", r.Host)
-	meta.Scope = "atproto"
+	meta.ClientID = fmt.Sprintf("https://%s/verifier-client-metadata.json", c.Request().Host)
+	meta.Scope = "atproto "
 	meta.ResponseTypes = append(meta.ResponseTypes, "vp_token")
-	meta.RedirectURIs = append(meta.RedirectURIs, fmt.Sprintf("https://%s/verifier/callback", r.Host))
+	meta.RedirectURIs = append(meta.RedirectURIs, fmt.Sprintf("https://%s/verifier/callback", c.Request().Host))
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(meta); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	return c.JSON(http.StatusOK, meta)
 }
 
-func (s *Server) VerifierCallback(w http.ResponseWriter, r *http.Request) {
-	// ctx := r.Context()
-
-	params := r.URL.Query()
+func (s *Server) VerifierCallback(c echo.Context) error {
+	params := c.Request().URL.Query()
 	slog.Info("received verifier callback", "params", params)
+	return nil
 }
