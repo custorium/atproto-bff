@@ -65,19 +65,31 @@ func main() {
 				EnvVars: []string{"PLC_HOST"},
 			},
 			&cli.StringFlag{
-				Name:  "proxy",
-				Usage: "proxy to sent",
-			},
-			&cli.StringFlag{
 				Name:  "listen",
 				Usage: "listen address",
 				Value: ":4201",
+			},
+			&cli.StringSliceFlag{
+				Name:  "proxy",
+				Usage: "<proxy prefix>:<did service>",
+				Value: cli.NewStringSlice("/xrpc:atproto_pds"),
+				Action: func(ctx *cli.Context, s []string) error {
+					return nil
+				},
+			},
+			&cli.StringSliceFlag{
+				Name:  "static",
+				Usage: "<statix prefix>:<static path>",
+			},
+			&cli.StringFlag{
+				Name:  "redirect",
+				Usage: "<statix prefix>:<static path>",
 			},
 		},
 	}
 	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
-	app.RunAndExitOnError()
+	app.Run(os.Args)
 }
 
 type Server struct {
@@ -112,14 +124,6 @@ var tmplHome = template.Must(template.Must(template.New("home.html").Parse(tmplB
 var tmplLoginText string
 var tmplLogin = template.Must(template.Must(template.New("login.html").Parse(tmplBaseText)).Parse(tmplLoginText))
 
-//go:embed "post.html"
-var tmplPostText string
-var tmplPost = template.Must(template.Must(template.New("post.html").Parse(tmplBaseText)).Parse(tmplPostText))
-
-//go:embed "post_success.html"
-var tmplPostSuccessText string
-var tmplPostSuccess = template.Must(template.Must(template.New("post_success.html").Parse(tmplBaseText)).Parse(tmplPostSuccessText))
-
 //go:embed "error.html"
 var tmplErrorText string
 var tmplError = template.Must(template.Must(template.New("error.html").Parse(tmplBaseText)).Parse(tmplErrorText))
@@ -132,13 +136,14 @@ func runServer(cctx *cli.Context) error {
 
 	li, err := lc.Listen(ctx, "tcp", cctx.String("listen"))
 	if err != nil {
-		return err
+		return cli.Exit(err.Error(), 1)
 	}
 
 	e := echo.New()
 	e.HideBanner = true
 	e.Listener = li
 	httpServer := &http.Server{}
+	e.Use(middleware.RequestLogger())
 
 	scopes := []string{"atproto", "include:org.farmapps.temp.ecrop.authFull"}
 
@@ -162,10 +167,10 @@ func runServer(cctx *cli.Context) error {
 	if cctx.String("client-secret-key") != "" && hostname != "" {
 		priv, err := atcrypto.ParsePrivateMultibase(cctx.String("client-secret-key"))
 		if err != nil {
-			return err
+			return cli.Exit(err.Error(), 1)
 		}
 		if err := config.SetClientSecret(priv, cctx.String("client-secret-key-id")); err != nil {
-			return err
+			return cli.Exit(err.Error(), 1)
 		}
 		slog.Info("configuring confidential OAuth client")
 	}
@@ -177,7 +182,7 @@ func runServer(cctx *cli.Context) error {
 		AuthRequestExpiryDuration: time.Minute * 30,
 	})
 	if err != nil {
-		return err
+		return cli.Exit(err.Error(), 1)
 	}
 	plchost := cctx.String("plc-host")
 	directory := NewDirectory(plchost)
@@ -188,6 +193,16 @@ func runServer(cctx *cli.Context) error {
 	srv := Server{
 		CookieStore: sessions.NewCookieStore([]byte(cctx.String("session-secret"))),
 		OAuth:       oauthClient,
+	}
+
+	if redirect := cctx.String("redirect"); redirect != "" {
+		parts := strings.Split(redirect, ":")
+		if len(parts) != 2 {
+			return cli.Exit("Invalid redirect", 1)
+		}
+		e.GET(parts[0], func(c echo.Context) error {
+			return c.Redirect(301, parts[1])
+		})
 	}
 
 	//These endpoint implement the verifier
@@ -208,21 +223,35 @@ func runServer(cctx *cli.Context) error {
 	oauth.GET("/logout", srv.OAuthLogout)
 	oauth.GET("/authenticated", srv.Authenticated)
 
-	api := e.Group("/api")
-	api.Any("/*", srv.Proxy)
+	for _, p := range cctx.StringSlice("proxy") {
+		parts := strings.Split(p, ":")
+		if len(parts) != 2 {
+			return cli.Exit("Invalid proxy", 1)
+		}
+		proxy := Proxy{
+			server:  &srv,
+			prefix:  parts[0],
+			service: parts[1],
+		}
+		api := e.Group(proxy.prefix)
+		api.Any("/*", proxy.HandleProxyRequest)
+	}
+
+	for _, s := range cctx.StringSlice("static") {
+		parts := strings.Split(s, ":")
+		if len(parts) != 2 {
+			return cli.Exit("Invalid static", 1)
+		}
+		static := e.Group(parts[0])
+		static.Use(middleware.StaticWithConfig(middleware.StaticConfig{
+			Root:   parts[1],
+			Browse: false,
+			HTML5:  true,
+		}))
+	}
 
 	// http.HandleFunc("POST /oauth/fedcmlogin", srv.FedCMLogin)
-
 	// http.HandleFunc("GET /oauth/walletlogin", srv.AtprotoWalletLogin)
-	e.Use(middleware.StaticWithConfig(middleware.StaticConfig{
-		Root:   "./wwwroot",
-		Browse: false,
-		HTML5:  true,
-	}))
-
-	// http.HandleFunc("GET /", srv.Homepage)
-	// http.HandleFunc("GET /bsky/post", srv.Post)
-	// http.HandleFunc("POST /bsky/post", srv.Post)
 
 	slog.Info("starting http server", "bind", li.Addr().String())
 	return e.StartServer(httpServer)
@@ -437,18 +466,37 @@ func copyHeader(src http.Header, target http.Header, header string) {
 	}
 }
 
-func (s *Server) Proxy(c echo.Context) error {
-	did, sessionID, _ := s.currentSessionDID(c.Request())
+type Proxy struct {
+	server  *Server
+	prefix  string
+	service string
+}
+
+func (p *Proxy) HandleProxyRequest(c echo.Context) error {
+
+	did, sessionID, _ := p.server.currentSessionDID(c.Request())
 	if did == nil {
 		return c.JSON(http.StatusUnauthorized, false)
 	}
 
-	session, err := s.OAuth.ResumeSession(c.Request().Context(), *did, sessionID)
+	session, err := p.server.OAuth.ResumeSession(c.Request().Context(), *did, sessionID)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, false)
 	}
 
-	target, _ := url.Parse("https://test.farmmaps.eu")
+	doc, err := p.server.OAuth.Dir.LookupDID(c.Request().Context(), session.Data.AccountDID)
+	if err != nil {
+		return c.String(http.StatusBadGateway, fmt.Sprintf("Bad gateway: did %s not found", session.Data.AccountDID))
+	}
+
+	endpoint := doc.GetServiceEndpoint(p.service)
+	if endpoint == "" {
+		return c.String(http.StatusBadGateway, fmt.Sprintf("Bad gateway: service %s not found for did %s", p.service, session.Data.AccountDID))
+	}
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		return c.String(http.StatusBadGateway, fmt.Sprintf("Bad gateway: service %s not found for did %s", p.service, session.Data.AccountDID))
+	}
 
 	headers := http.Header{}
 	copyHeader(c.Request().Header, headers, "accept")
@@ -463,75 +511,21 @@ func (s *Server) Proxy(c echo.Context) error {
 	copyHeader(c.Request().Header, headers, "origin")
 	copyHeader(c.Request().Header, headers, "access-control-request-headers")
 	copyHeader(c.Request().Header, headers, "access-control-request-method")
-	headers.Add("authorization", session.Data.AccessToken)
+
+	rt := &RoundTripper{session: session, server: p.server}
 
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			r.Out.Header = headers
 		},
+		Transport: rt,
 	}
+
 	proxy.ServeHTTP(c.Response(), c.Request())
 
 	return nil
 }
-
-// func (s *Server) Post(w http.ResponseWriter, r *http.Request) {
-// 	ctx := r.Context()
-
-// 	slog.Info("in post handler")
-
-// 	did, sessionID, handle := s.currentSessionDID(r)
-// 	if did == nil {
-// 		// TODO: supposed to set a WWW header; and could redirect?
-// 		http.Error(w, "not authenticated", http.StatusUnauthorized)
-// 		return
-// 	}
-
-// 	oauthSess, err := s.OAuth.ResumeSession(ctx, *did, sessionID)
-// 	if err != nil {
-// 		http.Error(w, "not authenticated", http.StatusUnauthorized)
-// 		return
-// 	}
-// 	c := oauthSess.APIClient()
-
-// 	if err := r.ParseForm(); err != nil {
-// 		http.Error(w, fmt.Errorf("parsing form data: %w", err).Error(), http.StatusBadRequest)
-// 		return
-// 	}
-// 	text := r.PostFormValue("post_text")
-
-// 	body := map[string]any{
-// 		"repo":       c.AccountDID.String(),
-// 		"collection": "app.bsky.feed.post",
-// 		"record": map[string]any{
-// 			"$type":     "app.bsky.feed.post",
-// 			"text":      text,
-// 			"facets":    parseFacets(text),
-// 			"createdAt": syntax.DatetimeNow(),
-// 		},
-// 	}
-// 	var resp struct {
-// 		Uri syntax.ATURI `json:"uri"` // the only field we care about
-// 	}
-
-// 	slog.Info("attempting post...", "text", text)
-// 	if err := c.Post(ctx, "com.atproto.repo.createRecord", body, &resp); err != nil {
-// 		postErr := fmt.Errorf("posting failed: %w", err).Error()
-// 		slog.Error(postErr)
-// 		tmplError.Execute(w, TmplData{DID: did, Handle: handle, Error: postErr})
-// 		return
-// 	}
-
-// 	tmplPostSuccess.Execute(w, SuccessTmplData{
-// 		DID:    did,
-// 		Handle: handle,
-// 		PdsUrl: oauthSess.Data.HostURL,
-// 		Repo:   resp.Uri.Authority().String(),
-// 		Rkey:   resp.Uri.RecordKey().String(),
-// 		AtUri:  resp.Uri.String(),
-// 	})
-// }
 
 // VP Verifier
 
@@ -550,4 +544,116 @@ func (s *Server) VerifierCallback(c echo.Context) error {
 	params := c.Request().URL.Query()
 	slog.Info("received verifier callback", "params", params)
 	return nil
+}
+
+// copy a request URL and strip query params and fragment, for DPoP
+func dpopURL(u *url.URL) string {
+	u2 := *u
+	u2.RawQuery = ""
+	u2.ForceQuery = false
+	u2.Fragment = ""
+	u2.RawFragment = ""
+	return u2.String()
+}
+
+// Parses a WWW-Authenticate response header to see if DPoP nonce update is indicated
+func isNonceUpdateHeader(hdr string) bool {
+	// Example from RFC9449:
+	// WWW-Authenticate: DPoP error="use_dpop_nonce", error_description="Resource server requires nonce in DPoP proof"
+	return strings.Contains(hdr, "error=\"use_dpop_nonce\"")
+}
+
+// Parses a WWW-Authenticate response header to see if access token has expired (needs refresh)
+func isExpiredAccessTokenHeader(hdr string) bool {
+	// Example from OAuth 2.1 draft:
+	// WWW-Authenticate: Bearer error="invalid_token" error_description="The access token expired"
+	// TODO: should this also look for "expired"?
+	return strings.Contains(hdr, "error=\"invalid_token\"")
+}
+
+type RoundTripper struct {
+	session *oauth.ClientSession
+	server  *Server
+}
+
+func (rt *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+
+	// durl := dpopURL(req.URL)
+
+	// accessToken, dpopNonce := rt.session.GetHostAccessData()
+	accessToken, _ := rt.session.GetHostAccessData()
+
+	// this method may need to retry twice, once for DPoP nonce update and once for token refresh
+	var resp *http.Response
+	var err error
+	for range 1 {
+		// dpopJWT, err := rt.session.NewHostDPoP(req.Method, durl)
+		// if err != nil {
+		// 	return nil, err
+		// }
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+		// req.Header.Set("Authorization", fmt.Sprintf("DPoP %s", accessToken))
+		// req.Header.Set("DPoP", dpopJWT)
+
+		resp, err = http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+
+		// on Success, or many types of error, just return HTTP response
+		// "Unauthorized" is HTTP status code 401
+		if resp.StatusCode != http.StatusUnauthorized || resp.Header.Get("WWW-Authenticate") == "" {
+			return resp, nil
+		}
+
+		authHdr := resp.Header.Get("WWW-Authenticate")
+		// dpopNonceHdr := resp.Header.Get("DPoP-Nonce")
+
+		// // if DPoP nonce changed, update and retry request
+		// if isNonceUpdateHeader(authHdr) && dpopNonceHdr != "" {
+		// 	// TODO: validate or normalize dpopNonceHdr in some way? eg minimum length
+		// 	if dpopNonceHdr == dpopNonce {
+		// 		return nil, fmt.Errorf("OAuth PDS DPoP nonce failure, but no new nonce supplied")
+		// 	}
+
+		// 	// persist new nonce value via callback
+		// 	rt.session.UpdateHostDPoPNonce(req.Context(), dpopNonceHdr)
+		// 	dpopNonce = dpopNonceHdr
+
+		// 	// retry request
+		// 	retry := req.Clone(req.Context())
+		// 	if req.GetBody != nil {
+		// 		retry.Body, err = req.GetBody()
+		// 		if err != nil {
+		// 			return nil, fmt.Errorf("GetBody failed when retrying API request: %w", err)
+		// 		}
+		// 	}
+		// 	req = retry
+		// 	continue
+		// }
+
+		// if access token expired, refresh and retry
+		if isExpiredAccessTokenHeader(authHdr) {
+			accessToken, err = rt.session.RefreshTokens(req.Context())
+			if err != nil {
+				return nil, fmt.Errorf("failed to refresh OAuth tokens: %w", err)
+			}
+
+			retry := req.Clone(req.Context())
+			if req.GetBody != nil {
+				retry.Body, err = req.GetBody()
+				if err != nil {
+					return nil, fmt.Errorf("GetBody failed when retrying API request: %w", err)
+				}
+			}
+			req = retry
+			continue
+		}
+
+		// otherwise, this was some other type of auth failure; just return the full response
+		// NOTE: in theory we could return an APIError here instead
+		return resp, nil
+	}
+
+	return nil, fmt.Errorf("OAuth client ran out of request retries")
 }
