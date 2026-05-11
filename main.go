@@ -93,6 +93,7 @@ func main() {
 }
 
 type Server struct {
+	IsLocalHost bool
 	CookieStore *sessions.CookieStore
 	OAuth       *oauth.ClientApp
 }
@@ -191,6 +192,7 @@ func runServer(cctx *cli.Context) error {
 	oauthClient.Dir = directory
 
 	srv := Server{
+		IsLocalHost: hostname == "",
 		CookieStore: sessions.NewCookieStore([]byte(cctx.String("session-secret"))),
 		OAuth:       oauthClient,
 	}
@@ -426,6 +428,10 @@ func (s *Server) OAuthCallback(c echo.Context) error {
 
 	// create signed cookie session, indicating account DID
 	sess, _ := s.CookieStore.Get(c.Request(), "oauth-demo")
+	if s.IsLocalHost {
+		sess.Options.Secure = false
+		sess.Options.SameSite = http.SameSiteLaxMode
+	}
 	sess.Values["account_did"] = sessData.AccountDID.String()
 	sess.Values["session_id"] = sessData.SessionID
 	sess.Values["handle"] = resp.Handle
