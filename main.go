@@ -79,11 +79,17 @@ func main() {
 			},
 			&cli.StringSliceFlag{
 				Name:  "static",
-				Usage: "<statix prefix>:<static path>",
+				Usage: "<static prefix>:<static path>",
 			},
 			&cli.StringFlag{
 				Name:  "redirect",
-				Usage: "<statix prefix>:<static path>",
+				Usage: "<redirect prefix>:<redirect path>",
+			},
+			&cli.StringSliceFlag{
+				Name:    "scope",
+				Value:   cli.NewStringSlice("atproto"),
+				Usage:   "requested scope",
+				EnvVars: []string{"CLIENT_SCOPE"},
 			},
 		},
 	}
@@ -146,7 +152,7 @@ func runServer(cctx *cli.Context) error {
 	httpServer := &http.Server{}
 	e.Use(middleware.RequestLogger())
 
-	scopes := []string{"atproto", "include:org.farmapps.temp.ecrop.authFull"}
+	scopes := cctx.StringSlice("scope")
 
 	var config oauth.ClientConfig
 	hostname := cctx.String("hostname")
