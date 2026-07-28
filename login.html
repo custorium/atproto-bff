@@ -8,12 +8,10 @@
       <input type="submit" value="Login">
     </fieldset>
   </form>
-  <p>If you're a Bluesky user, you already have an Atmosphere account.</p>
   <form method="post">
-    <input name="username" type="hidden", value="https://bsky.social">
-    <input class="secondary" type="submit" value="Create Account with Bluesky Social">
+    <input name="username" type="hidden", value="https://datalayers.eu">
+    <input class="secondary" type="submit" value="Create Account with datalayers">
   </form>
-  <a href="https://atproto.com/guides/self-hosting"><button class="secondary outline" style="width: 100%">Other options</button></a>
   {{if .Error}}
   <article style="background-color: #861D13;">
     {{.Error}}

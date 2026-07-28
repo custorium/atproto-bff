@@ -20,7 +20,7 @@
 <body>
 <header class="container">
   <hgroup>
-    <h1>atproto OAuth demo</h1>
+    <h1>Explorer</h1>
   </hgroup>
   <nav>
     <ul>
@@ -31,13 +31,12 @@
         {{ else }}
           <code>{{ .DID }}</code>
         {{ end }}
-      </span></li>
-      <li><a href="/bsky/post">Create Post</a></li>
+      </li>
       <li><a href="/oauth/logout">Logout</a></li>
-    {{ else }}
-      <li><a href="/oauth/login" onclick="fedcmlogin(event)">Login</a></li>
     {{ end }}
-      <li><a href="https://github.com/bluesky-social/cookbook/tree/main/go-oauth-web-app">Code</a></li>
+    {{ if .Error}}
+      <li><a href="/oauth/login" onclick="fedcmlogin(event)">Login</a></li>    
+    {{ end }}
     </ul>
   </nav>
 </header>

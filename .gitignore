@@ -5,3 +5,5 @@
 .vscode/launch.json
 go-oauth-web-app
 wwwroot/
+dist/
+__debug_bin3354684283

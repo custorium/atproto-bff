@@ -32,8 +32,8 @@ const serverListenerBootTimeout = 5 * time.Second
 
 func main() {
 	app := cli.App{
-		Name:   "oauth-web-demo",
-		Usage:  "atproto OAuth web server demo",
+		Name:   "atproto-bff",
+		Usage:  "atproto bff",
 		Action: runServer,
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -102,6 +102,7 @@ type Server struct {
 	IsLocalHost bool
 	CookieStore *sessions.CookieStore
 	OAuth       *oauth.ClientApp
+	Proxies     []Proxy
 }
 
 type TmplData struct {
@@ -241,6 +242,7 @@ func runServer(cctx *cli.Context) error {
 			prefix:  parts[0],
 			service: parts[1],
 		}
+		srv.Proxies = append(srv.Proxies, proxy)
 		api := e.Group(proxy.prefix)
 		api.Any("/*", proxy.HandleProxyRequest)
 	}
@@ -382,6 +384,7 @@ func (s *Server) Authenticated(c echo.Context) error {
 }
 
 func (s *Server) OAuthLogin(c echo.Context) error {
+
 	if c.Request().Method != "POST" {
 		tmplLogin.Execute(c.Response(), nil)
 		return nil
@@ -392,6 +395,26 @@ func (s *Server) OAuthLogin(c echo.Context) error {
 	}
 
 	username, _ := strings.CutPrefix(c.Request().PostFormValue("username"), "@")
+	username = strings.ToLower(username)
+
+	if atidentifier, err := syntax.ParseAtIdentifier(username); err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Errorf("%s is not a valid identifier", username))
+	} else {
+		doc, err := s.OAuth.Dir.Lookup(c.Request().Context(), *atidentifier)
+		if err != nil {
+			tmplLogin.Execute(c.Response(), TmplData{Error: fmt.Sprintf("identifier %s not found", username)})
+			return nil
+		}
+
+		for _, p := range s.Proxies {
+			endpoint := doc.GetServiceEndpoint(p.service)
+			if endpoint == "" {
+				tmplLogin.Execute(c.Response(), TmplData{Error: fmt.Sprintf("service %s not supported for user %s", p.service, username)})
+				return nil
+			}
+		}
+
+	}
 
 	slog.Info("OAuthLogin", "client_id", s.OAuth.Config.ClientID, "callback_url", s.OAuth.Config.CallbackURL)
 
