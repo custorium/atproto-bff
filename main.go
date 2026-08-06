@@ -546,6 +546,7 @@ func (p *Proxy) HandleProxyRequest(c echo.Context) error {
 	copyHeader(c.Request().Header, headers, "origin")
 	copyHeader(c.Request().Header, headers, "access-control-request-headers")
 	copyHeader(c.Request().Header, headers, "access-control-request-method")
+	copyHeader(c.Request().Header, headers, "connection")
 
 	rt := &RoundTripper{session: session, server: p.server}
 
