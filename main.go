@@ -548,6 +548,9 @@ func (p *Proxy) HandleProxyRequest(c echo.Context) error {
 	copyHeader(c.Request().Header, headers, "access-control-request-method")
 	copyHeader(c.Request().Header, headers, "connection")
 	copyHeader(c.Request().Header, headers, "upgrade")
+	copyHeader(c.Request().Header, headers, "sec-websocket-extensions")
+	copyHeader(c.Request().Header, headers, "sec-websocket-key")
+	copyHeader(c.Request().Header, headers, "sec-websocket-version")
 
 	rt := &RoundTripper{session: session, server: p.server}
 
